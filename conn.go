@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"net"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
@@ -26,7 +28,9 @@ var (
 )
 
 var (
-	localHost host.Host
+	localHost   host.Host
+	localPubSub *pubsub.PubSub
+	localTopic  *pubsub.Topic
 )
 
 //go:generate GOOS=linux GOARCH=amd64 go build -o conn .
@@ -78,8 +82,10 @@ func getPublicIP() (public net.IP) {
 	return net.ParseIP(string(bin))
 }
 func streamHandler(s network.Stream) {
-	s.Write([]byte("hello"))
-	s.Close()
+	fmt.Println("peer incoming:", s.Conn().RemotePeer().Pretty())
+	rw := bufio.NewReadWriter(bufio.NewReader(s), bufio.NewWriter(s))
+	go readData(rw)
+	go writeData(rw)
 }
 
 func pubsubTest() {
@@ -138,9 +144,89 @@ func client(serverAddr string) {
 	}
 
 	// handle stream
-	bin, err := ioutil.ReadAll(s)
-	if err != nil {
-		panic(bin)
+	rw := bufio.NewReadWriter(bufio.NewReader(s), bufio.NewWriter(s))
+	go readData(rw)
+	go writeData(rw)
+	select {}
+}
+
+func readData(rw *bufio.ReadWriter) {
+	for {
+		str, err := rw.ReadString('\n')
+		if err != nil {
+			fmt.Println("Error reading from buffer")
+			panic(err)
+		}
+
+		if str == "" {
+			return
+		}
+		if str != "\n" {
+			// Green console colour: 	\x1b[32m
+			// Reset console colour: 	\x1b[0m
+			fmt.Printf("\x1b[32m%s\x1b[0m> ", str)
+		}
+		if str == "join\n" {
+			localPubSub, err = pubsub.NewGossipSub(context.Background(), localHost)
+			if err != nil {
+				panic(err)
+			}
+			localTopic, err = localPubSub.Join(topic)
+			if err != nil {
+				panic(err)
+			}
+			sub, err := localTopic.Subscribe()
+			if err != nil {
+				panic(err)
+			}
+			go func() {
+				for {
+					msg, err := sub.Next(context.Background())
+					if err != nil {
+						panic(err)
+					}
+					fmt.Println(string(msg.Data))
+				}
+			}()
+		}
+		if str == "list\n" {
+			peers := localTopic.ListPeers()
+			fmt.Println("peers:[")
+			for _, pid := range peers {
+				fmt.Println(pid.Pretty())
+			}
+			fmt.Println("]")
+		}
+		if str == "publish\n" {
+			err := localTopic.Publish(context.Background(), []byte("msg"))
+			if err != nil {
+				panic(err)
+			}
+		}
+
 	}
-	s.Close()
+}
+
+func writeData(rw *bufio.ReadWriter) {
+	stdReader := bufio.NewReader(os.Stdin)
+
+	for {
+		fmt.Print("> ")
+		sendData, err := stdReader.ReadString('\n')
+		if err != nil {
+			fmt.Println("Error reading from stdin")
+			panic(err)
+		}
+
+		_, err = rw.WriteString(fmt.Sprintf("%s\n", sendData))
+		if err != nil {
+			fmt.Println("Error writing to buffer")
+			panic(err)
+		}
+		err = rw.Flush()
+		if err != nil {
+			fmt.Println("Error flushing buffer")
+			panic(err)
+		}
+	}
 }
