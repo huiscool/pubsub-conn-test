@@ -6,27 +6,36 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net"
+	"net/http"
+	"time"
 
 	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/peerstore"
 	"github.com/libp2p/go-libp2p-core/protocol"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/multiformats/go-multiaddr"
 )
 
 var (
 	port         = "18070"
 	testProtocol = protocol.ID("/conn-test/1.0.0")
+	topic        = "conn"
 )
 
-//go:generate go build -o conn .
+var (
+	localHost host.Host
+)
+
+//go:generate GOOS=linux GOARCH=amd64 go build -o conn .
 
 func main() {
 	// we need two host:
 	// one is the server, another is the client.
-	serverAddr := flag.String("-s", "", "-c /ip4/x.x.x.x/tcp/18070/p2p/xxx")
-
+	serverAddr := flag.String("s", "", "-s /ip4/x.x.x.x/tcp/18070/p2p/xxx")
+	flag.Parse()
 	if *serverAddr == "" {
 		server()
 	} else {
@@ -48,7 +57,9 @@ func server() {
 		panic(err)
 	}
 
-	host.SetStreamHandler(testProtocol, serverStreamHandler)
+	localHost = host
+
+	host.SetStreamHandler(testProtocol, streamHandler)
 
 	fmt.Printf("run \n./conn -s /ip4/%s/tcp/%s/p2p/%s\nin another computer\n", getPublicIP().String(), port, host.ID().Pretty())
 	// hang forever
@@ -56,59 +67,43 @@ func server() {
 }
 
 func getPublicIP() (public net.IP) {
-	ifaces, err := net.Interfaces()
+	resp, err := http.Get("http://bot.whatismyipaddress.com")
 	if err != nil {
 		panic(err)
 	}
-	// handle err
-	for _, i := range ifaces {
-		addrs, err := i.Addrs()
-		// handle err
-		if err != nil {
-			panic(err)
-		}
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			// process IP address,
-			if isPublicIP(ip) {
-				return ip
-			}
-		}
+	bin, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		panic(err)
 	}
-	// just panic
-	panic("cannot find a public IP")
+	return net.ParseIP(string(bin))
 }
-
-func isPublicIP(IP net.IP) bool {
-	if IP.IsLoopback() || IP.IsLinkLocalMulticast() || IP.IsLinkLocalUnicast() {
-		return false
-	}
-	if ip4 := IP.To4(); ip4 != nil {
-		switch {
-		case ip4[0] == 10:
-			return false
-		case ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31:
-			return false
-		case ip4[0] == 192 && ip4[1] == 168:
-			return false
-		default:
-			return true
-		}
-	}
-	return false
-}
-
-func serverStreamHandler(s network.Stream) {
-	//
-	fmt.Println("a new client comming:", s.Conn().RemotePeer().Pretty())
+func streamHandler(s network.Stream) {
 	s.Write([]byte("hello"))
 	s.Close()
+}
+
+func pubsubTest() {
+	psub, err := pubsub.NewGossipSub(context.Background(), localHost)
+	if err != nil {
+		panic(err)
+	}
+	topicItem, err := psub.Join(topic)
+	if err != nil {
+		panic(err)
+	}
+	// wait for our peer join
+	var peers = topicItem.ListPeers()
+	var retry = 10
+	for len(peers) == 0 && retry > 0 {
+		fmt.Println("not peers, waiting")
+		time.Sleep(1 * time.Second)
+		peers = topicItem.ListPeers()
+		retry--
+	}
+	if retry == 0 {
+		panic("cannot find peers")
+	}
+	fmt.Println(peers)
 }
 
 func client(serverAddr string) {
@@ -131,10 +126,11 @@ func client(serverAddr string) {
 	if err != nil {
 		panic(err)
 	}
+	localHost = host
 
 	host.Peerstore().AddAddrs(info.ID, info.Addrs, peerstore.PermanentAddrTTL)
 
-	host.SetStreamHandler(testProtocol, serverStreamHandler)
+	host.SetStreamHandler(testProtocol, streamHandler)
 
 	s, err := host.NewStream(context.Background(), info.ID, testProtocol)
 	if err != nil {
@@ -144,7 +140,7 @@ func client(serverAddr string) {
 	// handle stream
 	bin, err := ioutil.ReadAll(s)
 	if err != nil {
-		panic(err)
+		panic(bin)
 	}
-	fmt.Println(string(bin))
+	s.Close()
 }
